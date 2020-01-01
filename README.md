@@ -21,7 +21,7 @@ Follow instructions in turn to set up the environment and run experiments.
 
 1. Requirements:
     * Tensorflow 1.15.0. <br />
-        Activate the environment on EC2 :
+        Activate the environment on EC2:
         ```
         source activate tensorflow_p27
         ```
