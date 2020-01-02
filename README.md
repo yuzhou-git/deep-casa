@@ -3,6 +3,7 @@
 ## Introduction
 
 This is the Tensorflow implementation of ["Divide and conquer: A deep CASA approach to talker-independent monaural speaker separation"](https://web.cse.ohio-state.edu/~wang.77/papers/Liu-Wang.taslp19.pdf), IEEE/ACM Transactions on Audio, Speech, and Language Processing, vol. 27, pp. 2092-2102. 
+Please find demos and keynote lecture slides at ASRU-19 [here](http://web.cse.ohio-state.edu/~wang.77/talks/ASRU19.pptx).
 
 ## Contents
 
