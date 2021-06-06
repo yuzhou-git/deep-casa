@@ -3,8 +3,8 @@
 ## Introduction
 
 This is the Tensorflow implementation of:
-[1] ["Divide and conquer: A deep CASA approach to talker-independent monaural speaker separation"](https://web.cse.ohio-state.edu/~wang.77/papers/Liu-Wang.taslp19.pdf), IEEE/ACM Transactions on Audio, Speech, and Language Processing, vol. 27, pp. 2092-2102. 
-[2] ["Causal deep CASA for monaural talker-independent speaker separation"](https://web.cse.ohio-state.edu/~wang.77/papers/Liu-Wang.taslp20.pdf), IEEE/ACM Transactions on Audio, Speech, and Language Processing, vol. 28, pp. 2109-2118. 
+* [1] ["Divide and conquer: A deep CASA approach to talker-independent monaural speaker separation"](https://web.cse.ohio-state.edu/~wang.77/papers/Liu-Wang.taslp19.pdf), IEEE/ACM Transactions on Audio, Speech, and Language Processing, vol. 27, pp. 2092-2102. 
+* [2] ["Causal deep CASA for monaural talker-independent speaker separation"](https://web.cse.ohio-state.edu/~wang.77/papers/Liu-Wang.taslp20.pdf), IEEE/ACM Transactions on Audio, Speech, and Language Processing, vol. 28, pp. 2109-2118. 
 
 Please find demos and keynote lecture slides at ASRU-19 [here](http://web.cse.ohio-state.edu/~wang.77/talks/ASRU19.pptx).
 
@@ -55,7 +55,7 @@ Follow instructions in turn to set up the environment and run experiments.
     ```
     Thre are two arguments in `feat_gen.py`, `data_folder` and `wav_list_folder`. Change them to where your WSJ0-2mix dataset and file list locate. 
 
-5. Train the simultaneous grouping stage.
+5. Train the simultaneous grouping stage. <br />
     For non-causal deep CASA:
     ```
     TIME_STAMP=train_simul_group
@@ -72,7 +72,7 @@ Follow instructions in turn to set up the environment and run experiments.
     ```
     * Segment-level training is adopted. `batch_size` can be set to 4.
 
-6. Run inference of simultaneous grouping (tt set).
+6. Run inference of simultaneous grouping (tt set). <br />
     For non-causal deep CASA:
     ```
     RESUME_MODEL=exp/deep_casa_wsj/models/train_simul_group/deep_casa_wsj_model.ckpt_step_1
@@ -89,7 +89,7 @@ Follow instructions in turn to set up the environment and run experiments.
     ```
     * `$RESUME_MODEL` is the model to be loaded for inference. Change it accordingly.
 
-7. Generate temporary .npy file for the next stage (sequential grouping).
+7. Generate temporary .npy file for the next stage (sequential grouping). <br />
     For non-causal deep CASA:
     ```
     RESUME_MODEL=exp/deep_casa_wsj/models/train_simul_group/deep_casa_wsj_model.ckpt_step_1
@@ -104,7 +104,7 @@ Follow instructions in turn to set up the environment and run experiments.
     python nn/simul_group_causal.py --is_deploy 2 --resume_model $RESUME_MODEL
     ```
 
-8. Train the sequential grouping stage.
+8. Train the sequential grouping stage. <br />
     For non-causal deep CASA:
     ```
     TIME_STAMP=train_seq_group
@@ -118,7 +118,7 @@ Follow instructions in turn to set up the environment and run experiments.
     python nn/seq_group_causal.py --time_stamp $TIME_STAMP --is_deploy 0
     ```
 
-9. Run inference of sequential grouping (tt set).
+9. Run inference of sequential grouping (tt set). <br />
     For non-causal deep CASA:
     ```
     RESUME_MODEL=exp/deep_casa_wsj/models/train_seq_group/deep_casa_wsj_model.ckpt_step_1
