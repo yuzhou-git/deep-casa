@@ -1,5 +1,5 @@
 import numpy as np
-import gflags, os, sys, subprocess
+import gflags, os, sys
 from scipy.io.wavfile import read as wav_read
 from stft import stft,istft
 
@@ -16,7 +16,7 @@ wav_list_folder = FLAGS.wav_list_folder
 # Create experiment folder
 exp_name='deep_casa_wsj' # the experiment name
 exp_folder=base_folder +'/exp/'+ exp_name #the path for the experiment
-subprocess.call(base_folder + '/feat/exp_prepare_folder.sh '+ exp_name, shell=True)
+os.system('. feat/exp_prepare_folder.sh')
 
 wav_list_prefix = wav_list_folder + '/mix_2_spk_min'
 wav_path = data_folder + '/2speakers/wav8k/min/'
@@ -42,9 +42,9 @@ def get_feat(wav_list_prefix, wav_path, feat_path, task, fftsize=256, hopsize=64
             Zxx_1 = stft(clean_audio_1)
             Zxx_2 = stft(clean_audio_2)
             Zxx_mix = stft(mix_audio)
-            Zxx_1 = Zxx_1[:,0:(fftsize/2+1)]
-            Zxx_2 = Zxx_2[:,0:(fftsize/2+1)]
-            Zxx_mix = Zxx_mix[:,0:(fftsize/2+1)]
+            Zxx_1 = Zxx_1[:,0:(fftsize//2+1)]
+            Zxx_2 = Zxx_2[:,0:(fftsize//2+1)]
+            Zxx_mix = Zxx_mix[:,0:(fftsize//2+1)]
             # Store real and imaginary STFT of speaker1, speaker2 and mixture
             Zxx = np.stack((np.real(Zxx_1).astype('float32'),np.imag(Zxx_1).astype('float32'),np.real(Zxx_2).astype('float32'),np.imag(Zxx_2).astype('float32'),np.real(Zxx_mix).astype('float32'),np.imag(Zxx_mix).astype('float32')),axis=0)
             # Save features and targets to npy files

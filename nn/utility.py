@@ -18,8 +18,9 @@ def opt_assign(y1,y2,est1,est2):
     return ass
 
 # Compute input/output Dense-UNet paddings for a 2-D input shape
-def getUnetPadding(shape, n_layers=4):
-
+def getUnetPadding(shape, n_layers=4, is_causal=False):
+    # If is_causal, then no temporal padding for the feature
+    
     rem = shape 
     # Compute shape of the encoding layer
     for i in range(n_layers):
@@ -40,8 +41,13 @@ def getUnetPadding(shape, n_layers=4):
         output_shape = output_shape * 2 - 2
         input_shape = (input_shape + 2) * 2
         diff_list.append(input_shape - (output_shape + 2))
+        if is_causal:
+            diff_list[i][0] = 0
 
     input_shape += 2 # First conv
+    if is_causal:
+        input_shape[0] = shape[0]
+        output_shape[0] = shape[0]
     diff_list.append(input_shape - output_shape)
 
     return input_shape, output_shape, diff_list
@@ -55,7 +61,7 @@ def pad_freqs(tensor, target_shape):
 
     diff = target_freqs - input_freqs
     if diff % 2 == 0:
-        pad = [(diff/2, diff/2)]
+        pad = [(diff//2, diff//2)]
     else:
         pad = [(diff//2, diff//2 + 1)] # Add extra frequency bin at the end
 
@@ -69,8 +75,16 @@ def crop(x1, diff_x1_x2):
     x1 = x1[:,offsets0:-offsets0,offsets1:-offsets1,:]
     return x1
 
-def crop_and_concat(x1,x2,diff_x1_x2):
-    x1 = crop(x1,diff_x1_x2)
+def crop_causal(x1, diff_x1_x2):
+    offsets0 = diff_x1_x2[1]//2
+    x1 = x1[:,offsets0:-offsets0,:,:] 
+    return x1
+
+def crop_and_concat(x1,x2,diff_x1_x2,is_causal=False):
+    if is_causal:
+        x1 = crop_causal(x1,diff_x1_x2)
+    else:
+        x1 = crop(x1,diff_x1_x2)
     return tf.concat([x1, x2], axis=3)
 
 # Map estimated masks to a different range
@@ -78,6 +92,56 @@ def uncompress(x):
     x = tf.clip_by_value(x,-9.999, 9.999)
     x = -10.0 * tf.log((10.0-x)/(10.0+x))
     return x
+
+# Batch normalization
+def batch_norm(x, is_training, epsilon=0.001, decay=0.999, name='batch_norm'):
+
+    with tf.variable_scope(name):
+        size = x.get_shape().as_list()[-1]
+
+        scale = tf.get_variable('scale', [size], initializer=tf.ones_initializer)
+        offset = tf.get_variable('offset', [size], initializer=tf.zeros_initializer)
+
+        pop_mean = tf.get_variable('pop_mean', [size], initializer=tf.zeros_initializer, trainable=False)
+        pop_var = tf.get_variable('pop_var', [size], initializer=tf.ones_initializer, trainable=False)
+
+        def batch_statistics():
+            batch_mean, batch_var = tf.nn.moments(x, [0,1,2])
+            train_mean_op = tf.assign(pop_mean, pop_mean * decay + batch_mean * (1 - decay))
+            train_var_op = tf.assign(pop_var, pop_var * decay + batch_var * (1 - decay))
+            with tf.control_dependencies([train_mean_op, train_var_op]):
+                return tf.nn.batch_normalization(x, batch_mean, batch_var, offset, scale, epsilon)
+
+        def population_statistics():
+            return tf.nn.batch_normalization(x, pop_mean, pop_var, offset, scale, epsilon)
+
+        return tf.cond(is_training, batch_statistics, population_statistics)
+
+# Causal layer normalization
+def causal_layer_norm(x, total_dim=4, epsilon=0.001, decay=0.99, name='causal_layer_norm'):
+
+    with tf.variable_scope(name):
+        size = x.get_shape().as_list()[-1]
+
+        x_cum = tf.cumsum(x, axis=1)
+        x_sq_cum = tf.cumsum(tf.square(x), axis=1)
+        count_x = tf.ones_like(x,dtype=tf.float32)
+        count_x_cum = tf.cumsum(count_x, axis=1)
+
+        if total_dim == 4:
+            layer_mean = tf.reduce_sum(x_cum, [2,3], keep_dims=True) / tf.reduce_sum(count_x_cum, [2,3], keep_dims=True)
+            layer_var = tf.reduce_sum(x_sq_cum, [2,3], keep_dims=True) / tf.reduce_sum(count_x_cum, [2,3], keep_dims=True) - tf.square(tf.reduce_sum(x_cum, [2,3], keep_dims=True)) / tf.square(tf.reduce_sum(count_x_cum, [2,3], keep_dims=True))
+            scale = tf.get_variable('scale', [1,1,1,size], initializer=tf.ones_initializer)
+            offset = tf.get_variable('offset', [1,1,1,size], initializer=tf.zeros_initializer)
+        elif total_dim == 3:
+            layer_mean = tf.reduce_sum(x_cum, [2], keep_dims=True) / tf.reduce_sum(count_x_cum, [2], keep_dims=True)
+            layer_var = tf.reduce_sum(x_sq_cum, [2], keep_dims=True) / tf.reduce_sum(count_x_cum, [2], keep_dims=True) - tf.square(tf.reduce_sum(x_cum, [2], keep_dims=True)) / tf.square(tf.reduce_sum(count_x_cum, [2], keep_dims=True))
+            scale = tf.get_variable('scale', [1,1,size], initializer=tf.ones_initializer)
+            offset = tf.get_variable('offset', [1,1,size], initializer=tf.zeros_initializer)
+
+        x_output = (x-layer_mean)/tf.sqrt(layer_var+epsilon)*scale + offset
+
+        return x_output
 
 # TF calculation of iSTFT
 def inverse_stft(stfts,
@@ -142,8 +206,12 @@ def atrous_depth_conv1d(tensor, output_channels, keep_prob, is_causal=False, rat
                                    initializer=tf.truncated_normal_initializer(stddev=stddev))
 
         random_num_left = tf.random_uniform([1,1],minval=0,maxval=0.9999,dtype=tf.float32,name='left')
-        random_num_right = tf.random_uniform([1,1],minval=0,maxval=0.9999,dtype=tf.float32,name='right')
-        random_num_middle = tf.random_uniform([1,1],minval=0,maxval=0,dtype=tf.float32,name='middle')
+        if is_causal:
+            random_num_right = tf.random_uniform([1,1],minval=0,maxval=0,dtype=tf.float32,name='right')
+            random_num_middle = tf.random_uniform([1,1],minval=0,maxval=0.9999,dtype=tf.float32,name='middle')
+        else:
+            random_num_right = tf.random_uniform([1,1],minval=0,maxval=0.9999,dtype=tf.float32,name='right')
+            random_num_middle = tf.random_uniform([1,1],minval=0,maxval=0,dtype=tf.float32,name='middle')
 
         keep_prob_compare = tf.reshape(keep_prob, [1,1])
 
@@ -157,7 +225,12 @@ def atrous_depth_conv1d(tensor, output_channels, keep_prob, is_causal=False, rat
         filter_new = filter * tf.reshape(drop_mask, [1, size, 1, 1])
 
         # Pre processing for dilated convolution, expand one dimension
-        x = tf.expand_dims(tensor, axis=1)
+        if is_causal:
+            x = tf.expand_dims(tf.pad(tensor, [[0, 0], [int((size - 1) * rate), 0], [0, 0]]), axis=1)
+            pad = 'VALID'
+        else:
+            x = tf.expand_dims(tensor, axis=1)
+            pad = 'SAME'
         # Apply 2d convolution
         out = tf.nn.depthwise_conv2d(x, filter_new, strides=[1,1,1,1], padding=pad, rate=[1, int(rate)])
         out = tf.squeeze(out, axis=1)
@@ -185,7 +258,7 @@ def conv1d(input_, output_channels, filter_width = 1, stride = 1, stddev=0.02, n
         return conv
 
 # One residual sub-block in a TCN block 
-def residual_block(input_, rate,  n_dilated_units, n_bottle, keep_prob, scope="res"):
+def residual_block(input_, rate,  n_dilated_units, n_bottle, keep_prob, is_causal=False, scope="res"):
 
     input_shape = input_.get_shape()
     input_channels = input_shape[-1].value
@@ -196,15 +269,22 @@ def residual_block(input_, rate,  n_dilated_units, n_bottle, keep_prob, scope="r
                             output_channels=n_dilated_units,
                             name="bn_filter")
         aconv = parametric_relu(aconv, "bn_prelu")
-        aconv = tf.contrib.layers.layer_norm(aconv)
+        if is_causal:
+            aconv = causal_layer_norm(aconv, name='rb_1', total_dim=3)
+        else:
+            aconv = tf.contrib.layers.layer_norm(aconv)
 
         aconv = atrous_depth_conv1d(aconv,
                               output_channels=n_dilated_units,
-                              keep_prob = keep_prob,
+                              keep_prob=keep_prob,
+                              is_causal=is_causal,
                               rate=rate,
                               name="dilate_filter")
         aconv = parametric_relu(aconv, "dilate_prelu")
-        aconv = tf.contrib.layers.layer_norm(aconv)
+        if is_causal:
+            aconv = causal_layer_norm(aconv, name='rb_2', total_dim=3)
+        else:
+            aconv = tf.contrib.layers.layer_norm(aconv)
 
         aconv = conv1d(aconv,
                             output_channels=n_bottle,
@@ -215,7 +295,7 @@ def residual_block(input_, rate,  n_dilated_units, n_bottle, keep_prob, scope="r
         return res_output+aconv
 
 # Process validation and evaluation data to feed into the model
-def single_utt_feature_proc(y1_y2_x_utt, sig_all_utt, n_layers=4, hop_size=64):
+def single_utt_feature_proc(y1_y2_x_utt, sig_all_utt, n_layers=4, hop_size=64, is_causal=False):
     # load features and targets
     y1r_utt = np.squeeze(y1_y2_x_utt[0,:,:])
     y1i_utt = np.squeeze(y1_y2_x_utt[1,:,:])
@@ -226,7 +306,7 @@ def single_utt_feature_proc(y1_y2_x_utt, sig_all_utt, n_layers=4, hop_size=64):
     utt_len = np.asarray([xr_utt.shape[0]]).astype('int32')
 
     time_tmp = xr_utt.shape[0]
-    input_shape_test, output_shape_test, _ = getUnetPadding(np.array([xr_utt.shape[0], xr_utt.shape[1]]), n_layers=4)
+    input_shape_test, output_shape_test, _ = getUnetPadding(np.array([xr_utt.shape[0], xr_utt.shape[1]]), n_layers=4, is_causal=is_causal)
 
     # Pad according to the output size (along time axis)
     y1r_utt_pad = np.pad(y1r_utt, [(output_shape_test[0]-time_tmp, 0), (0,0)], mode='constant', constant_values=0.0)
@@ -236,7 +316,7 @@ def single_utt_feature_proc(y1_y2_x_utt, sig_all_utt, n_layers=4, hop_size=64):
     xr_utt_pad = np.pad(xr_utt, [(output_shape_test[0]-time_tmp, 0), (0,0)], mode='constant', constant_values=0.0)
     xi_utt_pad = np.pad(xi_utt, [(output_shape_test[0]-time_tmp, 0), (0,0)], mode='constant', constant_values=0.0)
     # Pad input (along time axis)
-    padding_frames = (input_shape_test[0] - output_shape_test[0]) / 2
+    padding_frames = (input_shape_test[0] - output_shape_test[0]) // 2
     xr_utt_pad = np.pad(xr_utt_pad, [(padding_frames, padding_frames), (0,0)], mode='constant', constant_values=0.0) # Pad along time axis
     xi_utt_pad = np.pad(xi_utt_pad, [(padding_frames, padding_frames), (0,0)], mode='constant', constant_values=0.0) # Pad along time axis
     # Pad frequency

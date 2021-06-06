@@ -18,12 +18,12 @@ gflags.DEFINE_string('wav_list_folder','/home/ubuntu/data/wsj0_2mix','Folder tha
 gflags.DEFINE_integer('is_adam', 1, 'Whether to use adam optimizer')
 gflags.DEFINE_float('learning_rate', 0.0001, 'Initial learning rate')
 gflags.DEFINE_float('lr_decay', 0.84, 'Learning rate decay') 
-gflags.DEFINE_float('keep_prob', 0.5, 'Keep rate in dropout')
 gflags.DEFINE_integer('epoch', 200, '# of epochs')
 gflags.DEFINE_integer('feat_dim', 129, 'Dimension of input feature')
 gflags.DEFINE_integer('fft_size', 256, '')
 gflags.DEFINE_integer('hop_size', 64, '')
-gflags.DEFINE_integer('batch_size', 1, 'Batch size. Each sample in a batch is a whole utterance.') 
+gflags.DEFINE_integer('batch_size', 4, 'Batch size.')
+gflags.DEFINE_integer('batch_frames', 200, '# of frames for each sample in a batch.')
 gflags.DEFINE_integer('n_layers', 4, '# of downsampling layers')
 gflags.DEFINE_integer('n_channels', 64, '# of channels in dense block')
 gflags.DEFINE_integer('is_deploy', 0, 'Inference or no. 0: training, 1: inference, 2: generate feature for the next stage')
@@ -50,17 +50,28 @@ wav_list_tr = wav_list_prefix + '_tr_mix'
 wav_list_cv = wav_list_prefix + '_cv_mix'
 wav_list_tt = wav_list_prefix + '_tt_mix'
 
-# Total training samples
-total_tr_files = len(open(wav_list_tr).readlines(  ))
-
 # Parameters
 learning_rate = FLAGS.learning_rate
 batch_size = FLAGS.batch_size
+batch_frames = FLAGS.batch_frames
 # Display training loss every 'display_step' batches
 display_step = 400
 
+# Total training samples in each epoch in terms of number of frames
+if FLAGS.is_deploy == 0:
+    total_tr_samples = 0
+    # Read all training features to compute
+    with open(wav_list_tr, 'r') as f:
+        for file,line in enumerate(f):
+            line = line.split('\n')[0]
+            y1_y2_x_utt = np.load(base_folder+'/tr/'+line+'.npy')
+            total_tr_samples += int(np.ceil(y1_y2_x_utt.shape[1]/batch_frames))*batch_frames
+else:
+    # Use a placeholder for evaluation
+    total_tr_samples = 100000
+
 # Compute dimension of padded input feature and output feature
-input_shape_tmp, output_shape_tmp, crop_diff_list = getUnetPadding(np.array([1000, feat_dim]))
+input_shape_tmp, output_shape_tmp, crop_diff_list = getUnetPadding(np.array([1000, feat_dim]), is_causal=True)
 n_input = input_shape_tmp[1] 
 n_output = output_shape_tmp[1]
 
@@ -76,10 +87,9 @@ sig_batch = tf.placeholder("float", [None, 2])  # waveform of the two speakers
 seq_len_batch = tf.placeholder("int32", [None]) # effective length of utterances in a batch (frames)
 lr = tf.placeholder("float")
 is_training = tf.placeholder(tf.bool)
-keep_prob = tf.placeholder("float")
 
 # Define tf queue for training data loading
-q = tf.PaddingFIFOQueue(50, [tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.int32], shapes=[[None, n_input], [None, n_input], [None, n_output], [None, n_output], [None, n_output], [None, n_output], [None, 2], [None]])
+q = tf.PaddingFIFOQueue(100, [tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.int32], shapes=[[None, n_input], [None, n_input], [None, n_output], [None, n_output], [None, n_output], [None, n_output], [None, 2], [None]])
 enqueue_op = q.enqueue([xr_batch, xi_batch, y1r_batch, y1i_batch, y2r_batch, y2i_batch, sig_batch, seq_len_batch])
 queue_size = q.size()
 
@@ -108,6 +118,15 @@ def load_and_enqueue(sess, enqueue_op, coord, queue_index, total_queues):
     # file pointer for reading thread
     current_file = 0
 
+    # list to hold and feed training samples
+    xr_waiting = list()
+    xi_waiting = list()
+    y1r_waiting  = list()
+    y1i_waiting  = list()
+    y2r_waiting  = list()
+    y2i_waiting  = list()
+    sig_waiting  = list()
+
     # If not stop, keep reading
     while not coord.should_stop():
         if current_file == len(all_training_files):
@@ -116,75 +135,109 @@ def load_and_enqueue(sess, enqueue_op, coord, queue_index, total_queues):
         if current_file == 0:
             np.random.shuffle(all_training_files)
 
-        # Data to be loaded
-        xr_2batch = list()
-        xi_2batch = list()
-        y1r_2batch = list()
-        y1i_2batch = list()
-        y2r_2batch = list()
-        y2i_2batch = list()
-        sig_2batch = list()
-        time_list = np.zeros([batch_size]).astype('int32')
+        # In causal Dense-UNet training:
+        # We cut utterances into segements, put the segments in a data buffer, shuffle them, then feed them to training
 
-        # Load each utterance in the batch
-        for batch_index in range(batch_size):
-            y1_y2_x_utt = np.load(base_folder+'/tr/'+all_training_files[current_file+batch_index]+'.npy')
-            sig_all_utt = np.load(base_folder+'/tr/'+all_training_files[current_file+batch_index]+'_wave.npy')
+        # Number of utts in data buffer
+        buffer_size = 40
+
+        # Data buffers
+        xr_buffer = list()
+        xi_buffer = list()
+        y1r_buffer = list()
+        y1i_buffer = list()
+        y2r_buffer = list()
+        y2i_buffer = list()
+        sig_buffer = list()
+
+        # to be fed to seq_len
+        time_list = np.ones([batch_size]).astype('int32') * batch_frames
+
+        # Load each utterance in the buffer
+        for buffer_index in range(buffer_size):
+            y1_y2_x_utt = np.load(base_folder+'/tr/'+all_training_files[current_file+buffer_index]+'.npy')
+            sig_all_utt = np.load(base_folder+'/tr/'+all_training_files[current_file+buffer_index]+'_wave.npy')
 
             # Load each part of the data
-            y1r_2batch.append(np.squeeze(y1_y2_x_utt[0,:,:]))
-            y1i_2batch.append(np.squeeze(y1_y2_x_utt[1,:,:]))
-            y2r_2batch.append(np.squeeze(y1_y2_x_utt[2,:,:]))
-            y2i_2batch.append(np.squeeze(y1_y2_x_utt[3,:,:]))
-            xr_2batch.append(np.squeeze(y1_y2_x_utt[4,:,:]))
-            xi_2batch.append(np.squeeze(y1_y2_x_utt[5,:,:]))
-            sig_2batch.append(np.transpose(sig_all_utt[:2,:]))
+            y1r_utt = np.squeeze(y1_y2_x_utt[0,:,:])
+            y1i_utt = np.squeeze(y1_y2_x_utt[1,:,:])
+            y2r_utt = np.squeeze(y1_y2_x_utt[2,:,:])
+            y2i_utt = np.squeeze(y1_y2_x_utt[3,:,:])
+            xr_utt = np.squeeze(y1_y2_x_utt[4,:,:])
+            xi_utt = np.squeeze(y1_y2_x_utt[5,:,:])
+            sig_utt = np.transpose(sig_all_utt[:2,:])
 
-            time_list[batch_index] = y1_y2_x_utt.shape[1]
-           
-        # length of the longest utterance in a batch
-        max_time = np.max(time_list)
-        freq_dim = xr_2batch[0].shape[1]
-        # Compute input and output shape for all samples in a batch
-        input_shape, output_shape, _ = getUnetPadding(np.array([max_time, freq_dim]))
+            # Compute input and output shape
+            freq_dim = xr_utt.shape[1]
+            input_shape, output_shape, _ = getUnetPadding(np.array([batch_frames, freq_dim]), is_causal=True)
 
-        # Apply paddings to all training samples
-        for batch_index in range(batch_size):
-            # Pad all samples in the batch. Pad difference between max_time and output shape (along time axis)
-            y1r_2batch[batch_index] = np.pad(y1r_2batch[batch_index], [(output_shape[0]-max_time, max_time-time_list[batch_index]), (0,0)], mode='constant', constant_values=0.0)
-            y1i_2batch[batch_index] = np.pad(y1i_2batch[batch_index], [(output_shape[0]-max_time, max_time-time_list[batch_index]), (0,0)], mode='constant', constant_values=0.0)
-            y2r_2batch[batch_index] = np.pad(y2r_2batch[batch_index], [(output_shape[0]-max_time, max_time-time_list[batch_index]), (0,0)], mode='constant', constant_values=0.0)
-            y2i_2batch[batch_index] = np.pad(y2i_2batch[batch_index], [(output_shape[0]-max_time, max_time-time_list[batch_index]), (0,0)], mode='constant', constant_values=0.0)
-            xr_2batch[batch_index] = np.pad(xr_2batch[batch_index], [(output_shape[0]-max_time, max_time-time_list[batch_index]), (0,0)], mode='constant', constant_values=0.0)
-            xi_2batch[batch_index] = np.pad(xi_2batch[batch_index], [(output_shape[0]-max_time, max_time-time_list[batch_index]), (0,0)], mode='constant', constant_values=0.0)
-            sig_2batch[batch_index] = np.pad(sig_2batch[batch_index], [(FLAGS.hop_size*(output_shape[0]-max_time), FLAGS.hop_size*(max_time-time_list[batch_index])), (0,0)], mode='constant', constant_values=0.0)
-            # Pad input time (input is larger than ouput)
-            padding_frames = (input_shape[0] - output_shape[0]) // 2
-            xr_2batch[batch_index] = np.pad(xr_2batch[batch_index], [(padding_frames, padding_frames), (0,0)], mode='constant', constant_values=0.0) # Pad along time axis
-            xi_2batch[batch_index] = np.pad(xi_2batch[batch_index], [(padding_frames, padding_frames), (0,0)], mode='constant', constant_values=0.0) # Pad along time axis
-            # Pad frequency
-            y1r_2batch[batch_index] = pad_freqs(y1r_2batch[batch_index], output_shape)
-            y1i_2batch[batch_index] = pad_freqs(y1i_2batch[batch_index], output_shape)
-            y2r_2batch[batch_index] = pad_freqs(y2r_2batch[batch_index], output_shape)
-            y2i_2batch[batch_index] = pad_freqs(y2i_2batch[batch_index], output_shape)
-            xr_2batch[batch_index] = pad_freqs(xr_2batch[batch_index], input_shape)
-            xi_2batch[batch_index] = pad_freqs(xi_2batch[batch_index], input_shape)
+            # Number of segments cut from the current utterance
+            num_seg = int(np.ceil(xr_utt.shape[0]/batch_frames))
 
-        y1r_2batch = np.vstack(y1r_2batch)
-        y1i_2batch = np.vstack(y1i_2batch)
-        y2r_2batch = np.vstack(y2r_2batch)
-        y2i_2batch = np.vstack(y2i_2batch)
-        xr_2batch = np.vstack(xr_2batch)
-        xi_2batch = np.vstack(xi_2batch)
-        sig_2batch = np.vstack(sig_2batch)
+            # Process each segment
+            for seg_idx in range(num_seg):
+                if seg_idx != num_seg - 1 :
+                    xr_tobuff = xr_utt[(seg_idx*batch_frames):((seg_idx+1)*batch_frames),:]
+                    xi_tobuff = xi_utt[(seg_idx*batch_frames):((seg_idx+1)*batch_frames),:]
+                    y1r_tobuff = y1r_utt[(seg_idx*batch_frames):((seg_idx+1)*batch_frames),:]
+                    y1i_tobuff = y1i_utt[(seg_idx*batch_frames):((seg_idx+1)*batch_frames),:]
+                    y2r_tobuff = y2r_utt[(seg_idx*batch_frames):((seg_idx+1)*batch_frames),:]
+                    y2i_tobuff = y2i_utt[(seg_idx*batch_frames):((seg_idx+1)*batch_frames),:]
+                    sig_tobuff = sig_utt[(seg_idx*batch_frames*FLAGS.hop_size):(((seg_idx+1)*batch_frames+3)*FLAGS.hop_size),:]
+                else:
+                    end_padding = num_seg*batch_frames - xr_utt.shape[0]
+                    xr_tobuff = np.pad(xr_utt[(seg_idx*batch_frames):,:], [(0, end_padding), (0,0)], mode='constant', constant_values=0.0)
+                    xi_tobuff = np.pad(xi_utt[(seg_idx*batch_frames):,:], [(0, end_padding), (0,0)], mode='constant', constant_values=0.0)
+                    y1r_tobuff = np.pad(y1r_utt[(seg_idx*batch_frames):,:], [(0, end_padding), (0,0)], mode='constant', constant_values=0.0)
+                    y1i_tobuff = np.pad(y1i_utt[(seg_idx*batch_frames):,:], [(0, end_padding), (0,0)], mode='constant', constant_values=0.0)
+                    y2r_tobuff = np.pad(y2r_utt[(seg_idx*batch_frames):,:], [(0, end_padding), (0,0)], mode='constant', constant_values=0.0)
+                    y2i_tobuff = np.pad(y2i_utt[(seg_idx*batch_frames):,:], [(0, end_padding), (0,0)], mode='constant', constant_values=0.0)
+                    sig_tobuff = np.pad(sig_utt[(seg_idx*batch_frames*FLAGS.hop_size):,:], [(0, end_padding*FLAGS.hop_size), (0,0)], mode='constant', constant_values=0.0)
 
-        # enqueue operation
-        sess.run(enqueue_op, feed_dict={xr_batch: xr_2batch, xi_batch: xi_2batch, y1r_batch: y1r_2batch, y1i_batch: y1i_2batch, y2r_batch: y2r_2batch, y2i_batch: y2i_2batch, sig_batch: sig_2batch, seq_len_batch: time_list})
+                xr_buffer.append(pad_freqs(xr_tobuff, input_shape))
+                xi_buffer.append(pad_freqs(xi_tobuff, input_shape))
+                y1r_buffer.append(pad_freqs(y1r_tobuff, output_shape)) 
+                y1i_buffer.append(pad_freqs(y1i_tobuff, output_shape))
+                y2r_buffer.append(pad_freqs(y2r_tobuff, output_shape))
+                y2i_buffer.append(pad_freqs(y2i_tobuff, output_shape))
+                sig_buffer.append(sig_tobuff)
 
-        current_file += batch_size
+        # Shuffle all the segments. 
+        size_buffer = len(xr_buffer)
+        zipped_feats = list(zip(xr_buffer, xi_buffer, y1r_buffer, y1i_buffer, y2r_buffer, y2i_buffer, sig_buffer))
+        np.random.shuffle(zipped_feats)
+        xr_buffer, xi_buffer, y1r_buffer, y1i_buffer, y2r_buffer, y2i_buffer, sig_buffer = zip(*zipped_feats)
 
-# Define Dense_UNet model
-def Dense_UNet(_XR, _XI, _seq_len, training, keep_prob):
+        # Merge the buffers and the waiting lists
+        xr_waiting = xr_waiting + list(xr_buffer)
+        xi_waiting = xi_waiting + list(xi_buffer)
+        y1r_waiting = y1r_waiting + list(y1r_buffer)
+        y1i_waiting = y1i_waiting + list(y1i_buffer)
+        y2r_waiting = y2r_waiting + list(y2r_buffer)
+        y2i_waiting = y2i_waiting + list(y2i_buffer)
+        sig_waiting = sig_waiting + list(sig_buffer)
+
+        while len(xr_waiting) >= batch_size:
+            xr_2batch = np.vstack(xr_waiting[:batch_size])
+            xi_2batch = np.vstack(xi_waiting[:batch_size])
+            y1r_2batch = np.vstack(y1r_waiting[:batch_size])
+            y1i_2batch = np.vstack(y1i_waiting[:batch_size])
+            y2r_2batch = np.vstack(y2r_waiting[:batch_size])
+            y2i_2batch = np.vstack(y2i_waiting[:batch_size])
+            sig_2batch = np.vstack(sig_waiting[:batch_size])
+            sess.run(enqueue_op, feed_dict={xr_batch: xr_2batch, xi_batch: xi_2batch, y1r_batch: y1r_2batch, y1i_batch: y1i_2batch, y2r_batch: y2r_2batch, y2i_batch: y2i_2batch, sig_batch: sig_2batch, seq_len_batch: time_list})
+            xr_waiting = xr_waiting[batch_size:]
+            xi_waiting = xi_waiting[batch_size:]
+            y1r_waiting = y1r_waiting[batch_size:]
+            y1i_waiting = y1i_waiting[batch_size:]
+            y2r_waiting = y2r_waiting[batch_size:]
+            y2i_waiting = y2i_waiting[batch_size:]
+            sig_waiting = sig_waiting[batch_size:]
+
+        current_file += buffer_size
+
+# Define causal Dense_UNet model
+def Causal_Dense_UNet(_XR, _XI, _seq_len, training):
     # input shape: (batch_size * time, n_input)
     num_seq = tf.shape(_seq_len)[0]
     inputR = _XR
@@ -199,7 +252,6 @@ def Dense_UNet(_XR, _XI, _seq_len, training, keep_prob):
 
         enc_outputs = list() # list for skip connections
         _initializer=tf.truncated_normal_initializer(stddev=0.02) # Weight initializer for cnn layers
-        _initializer_stride = tf.random_normal_initializer(mean=0.0, stddev=0.5) # Weight initializer for downsampling filters
 
         # Initial input (Batch, frequency, time, channel)
         current_layer = tf.concat([inputR,inputI], 3)
@@ -214,26 +266,26 @@ def Dense_UNet(_XR, _XI, _seq_len, training, keep_prob):
                 # Frequency mapping layer
                 current_layer = tf.layers.conv2d(skip_input, n_channels, 1, activation=None, padding='same', kernel_initializer=_initializer)
                 current_layer = tf.nn.elu(current_layer)
-                current_layer = tf.contrib.layers.layer_norm(current_layer)
+                current_layer = batch_norm(current_layer, is_training=training, name='dense_-1_fm')
                 current_layer = tf.transpose(current_layer, [0,3,2,1])
                 f_dim = current_layer.get_shape()[-1].value
                 current_layer = tf.layers.conv2d(current_layer, f_dim, (1,1), activation=None, padding='same', kernel_initializer=_initializer)
                 current_layer = tf.transpose(current_layer, [0,3,2,1])
             elif j != 4:
-                current_layer = tf.layers.conv2d(skip_input, n_channels, 3, activation=None, padding='same', kernel_initializer=_initializer)
+                current_layer = tf.pad(skip_input, [[0, 0], [1, 1], [2, 0], [0, 0]])
+                current_layer = tf.layers.conv2d(current_layer, n_channels, (3,3), activation=None, padding='valid', kernel_initializer=_initializer)
             else:
-                current_layer = tf.layers.conv2d(skip_input, n_channels, 3, activation=None, padding='valid', kernel_initializer=_initializer)
+                current_layer = tf.pad(skip_input, [[0, 0], [0, 0], [2, 0], [0, 0]])
+                current_layer = tf.layers.conv2d(current_layer, n_channels, (3,3), activation=None, padding='valid', kernel_initializer=_initializer)
             current_layer = tf.nn.elu(current_layer)
-            current_layer = tf.contrib.layers.layer_norm(current_layer)
+            current_layer = batch_norm(current_layer, is_training=training, name='dense_-1_%d'%j)
 
         enc_outputs.append(current_layer)
 
         # Downsampling dense blocks
         for i in range(n_layers):
-            # Downsampling filtering
-            filter = tf.get_variable("w%d"%i, [2, 2, n_channels, 1],initializer=_initializer_stride)
-            current_layer = tf.nn.dropout(current_layer, keep_prob)
-            current_layer = tf.nn.depthwise_conv2d(current_layer, filter, strides=[1,2,2,1], padding='VALID')
+            # Downsampling with maxpooling
+            current_layer = tf.layers.max_pooling2d(current_layer, pool_size=(2,1), strides=(2,1), padding='valid', data_format='channels_last')
             # Dense block
             for j in range(5):
                 if j == 0:
@@ -243,17 +295,19 @@ def Dense_UNet(_XR, _XI, _seq_len, training, keep_prob):
                 if j == 2:
                     current_layer = tf.layers.conv2d(skip_input, n_channels, 1, activation=None, padding='same', kernel_initializer=_initializer)
                     current_layer = tf.nn.elu(current_layer)
-                    current_layer = tf.contrib.layers.layer_norm(current_layer)
+                    current_layer = batch_norm(current_layer, is_training=training, name='dense_u_%d_fm'%i)
                     current_layer = tf.transpose(current_layer, [0,3,2,1])
                     f_dim = current_layer.get_shape()[-1].value
                     current_layer = tf.layers.conv2d(current_layer, f_dim, (1,1), activation=None, padding='same', kernel_initializer=_initializer)
                     current_layer = tf.transpose(current_layer, [0,3,2,1])
                 elif j != 4:
-                    current_layer = tf.layers.conv2d(skip_input, n_channels, 3, activation=None, padding='same', kernel_initializer=_initializer)
+                    current_layer = tf.pad(skip_input, [[0, 0], [1, 1], [2, 0], [0, 0]])
+                    current_layer = tf.layers.conv2d(current_layer, n_channels, (3,3), activation=None, padding='valid', kernel_initializer=_initializer)
                 else:
-                    current_layer = tf.layers.conv2d(skip_input, n_channels, 3, activation=None, padding='valid', kernel_initializer=_initializer)
+                    current_layer = tf.pad(skip_input, [[0, 0], [0, 0], [2, 0], [0, 0]])
+                    current_layer = tf.layers.conv2d(current_layer, n_channels, (3,3), activation=None, padding='valid', kernel_initializer=_initializer)
                 current_layer = tf.nn.elu(current_layer)
-                current_layer = tf.contrib.layers.layer_norm(current_layer)
+                current_layer = batch_norm(current_layer, is_training=training, name='dense_u_%d_%d'%(i,j))
             # Skip connection
             if i < n_layers - 1:
                 enc_outputs.append(current_layer)
@@ -261,11 +315,11 @@ def Dense_UNet(_XR, _XI, _seq_len, training, keep_prob):
         # Upsampling dense blocks
         for i in range(n_layers):
             # Transpose convolution
-            current_layer = tf.layers.conv2d_transpose(current_layer, n_channels, 2, strides=2, activation=None, padding='valid', kernel_initializer=_initializer)
+            current_layer = tf.layers.conv2d_transpose(current_layer, n_channels, (2,1), strides=(2,1), activation=None, padding='valid', kernel_initializer=_initializer)
             current_layer = tf.nn.elu(current_layer)
-            current_layer = tf.contrib.layers.layer_norm(current_layer)
+            current_layer = batch_norm(current_layer, is_training=training, name='dense_d_%d_tc'%i)
             # Skip connnection
-            current_layer = crop_and_concat(enc_outputs[-i-1], current_layer, crop_diff_list[i])
+            current_layer = crop_and_concat(enc_outputs[-i-1], current_layer, crop_diff_list[i], is_causal=True)
             # Dense block
             for j in range(5):
                 if j == 0:
@@ -275,18 +329,20 @@ def Dense_UNet(_XR, _XI, _seq_len, training, keep_prob):
                 if j == 2:
                     current_layer = tf.layers.conv2d(skip_input, n_channels, 1, activation=None, padding='same', kernel_initializer=_initializer)
                     current_layer = tf.nn.elu(current_layer)
-                    current_layer = tf.contrib.layers.layer_norm(current_layer)
+                    current_layer = batch_norm(current_layer, is_training=training, name='dense_d_%d_fm'%i)
                     current_layer = tf.transpose(current_layer, [0,3,2,1])
                     f_dim = current_layer.get_shape()[-1].value
                     current_layer = tf.layers.conv2d(current_layer, f_dim, (1,1), activation=None, padding='same', kernel_initializer=_initializer)
                     current_layer = tf.transpose(current_layer, [0,3,2,1])
                 elif j != 4:
-                    current_layer = tf.layers.conv2d(skip_input, n_channels, 3, activation=None, padding='same', kernel_initializer=_initializer)
+                    current_layer = tf.pad(skip_input, [[0, 0], [1, 1], [2, 0], [0, 0]])
+                    current_layer = tf.layers.conv2d(current_layer, n_channels, (3,3), activation=None, padding='valid', kernel_initializer=_initializer)
                 else:
-                    current_layer = tf.layers.conv2d(skip_input, n_channels, 3, activation=None, padding='valid', kernel_initializer=_initializer)
+                    current_layer = tf.pad(skip_input, [[0, 0], [0, 0], [2, 0], [0, 0]])
+                    current_layer = tf.layers.conv2d(current_layer, n_channels, (3,3), activation=None, padding='valid', kernel_initializer=_initializer)
 
                 current_layer = tf.nn.elu(current_layer)
-                current_layer = tf.contrib.layers.layer_norm(current_layer)
+                current_layer = batch_norm(current_layer, is_training=training, name='dense_d_%d_%d'%(i,j))
 
         # Output layer
         current_layer = tf.layers.conv2d(current_layer, n_channels, 1, activation=tf.nn.elu, padding='same')
@@ -304,8 +360,8 @@ def Dense_UNet(_XR, _XI, _seq_len, training, keep_prob):
         mask2I = uncompress(mask2I)
 
         # Cropped input
-        inputR_crop = crop(inputR, crop_diff_list[-1])
-        inputI_crop = crop(inputI, crop_diff_list[-1])
+        inputR_crop = crop_causal(inputR, crop_diff_list[-1])
+        inputI_crop = crop_causal(inputI, crop_diff_list[-1])
 
         # Complex masking
         est1R = tf.multiply(inputR_crop, mask1R) - tf.multiply(inputI_crop, mask1I)
@@ -415,7 +471,7 @@ def PIT_cost(Y1R,Y1I,Y2R,Y2I,EST1,EST2,SIG,_seq_len):
     return SNR, loss, EST1_sig, EST2_sig
 
 # Outputs of the network and loss
-est1,est2,mask1,mask2=Dense_UNet(xr,xi,seq_len,is_training,keep_prob)
+est1,est2,mask1,mask2=Causal_Dense_UNet(xr,xi,seq_len,is_training)
 snr,cost,est1_sig,est2_sig=PIT_cost(y1r,y1i,y2r,y2i,est1,est2,sig,seq_len)
 
 # Define loss and optimizer
@@ -450,7 +506,7 @@ with tf.Session() as sess:
     # If training, initialize all data loaders
     if FLAGS.is_deploy == 0:
         coord = tf.train.Coordinator()
-        num_threads = 2 # Use 2 threads for data loading, each thread touches different part of training data
+        num_threads = 1 # Use 1 threads for data loading, each thread touches different part of training data
         t = [threading.Thread(target=load_and_enqueue, args=(sess,enqueue_op,coord,i,num_threads))  for i in range(num_threads)]
         for tmp_t in t:
             tmp_t.start()
@@ -477,14 +533,16 @@ with tf.Session() as sess:
     cv_sig_buffer = list()
     cv_loaded = 0
 
+    steps_per_epoch = int(total_tr_samples / batch_size / batch_frames)
+
     # Keep training until reaching max iterations
-    while step  < FLAGS.epoch * total_tr_files / batch_size:
-        
+    while step <= FLAGS.epoch * steps_per_epoch:
+
         # At the beginning of each epoch
         # If FLAGS.is_deploy is 0, run validation at the beginning of each epoch
         # IF FLAGS.is_deploy is 1, run evaluation and exit
         # If FLAGS.is_deploy is 2, generate data for sequential grouping and exit
-        if step % (total_tr_files // batch_size) == 1:
+        if step % steps_per_epoch == 1:
             
             if FLAGS.is_deploy == 0:
                 # CV
@@ -509,10 +567,13 @@ with tf.Session() as sess:
                             sig_all_utt = cv_sig_buffer[file]
 
                         # load features and targets
-                        y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, sig_all_utt) 
+                        y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, \
+                            y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, \
+                            sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, sig_all_utt, is_causal=True) 
 
                         test_cost, test_snr = sess.run([cost, snr], \
-                        feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, y2i: y2i_utt_pad, sig: sig_utt_pad, seq_len: utt_len, keep_prob: 1, is_training: False})
+                        feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, \
+                            y2i: y2i_utt_pad, sig: sig_utt_pad, seq_len: utt_len, is_training: False})
                         cost_list.append(test_cost)
                         snr_list.append(test_snr)
                         
@@ -550,12 +611,15 @@ with tf.Session() as sess:
                             sig_all_utt = np.load(base_folder+'/'+task_list[tasks]+'/'+line+'_wave.npy')
 
                             # Load features and targets
-                            y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, sig_all_utt)
+                            y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, \
+                                y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, \
+                                sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, sig_all_utt, is_causal=True)
                             # Either generate .npy file for sequential grouping training, or generate file for evaluation
                             if FLAGS.is_deploy == 2:
                                 # .npy file for sequential grouping training
                                 est_1, est_2=sess.run([est1,est2],\
-                                    feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, y2i: y2i_utt_pad, sig: sig_utt_pad, seq_len: utt_len, keep_prob: 1, is_training: False})
+                                    feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, \
+                                    y2i: y2i_utt_pad, sig: sig_utt_pad, seq_len: utt_len, is_training: False})
                                 total_est = np.stack((est_1,est_2),axis=0)
                                 np.save(base_folder+'/'+task_list[tasks]+'/'+line +'_simul_est', total_est)
                                 logging.info('saving ' + base_folder+'/'+task_list[tasks]+'/'+line +'_simul_est')
@@ -563,9 +627,10 @@ with tf.Session() as sess:
                             elif FLAGS.is_deploy == 1:
                                 # Generate file for evaluation
                                 est_1, est_2, sig_1, sig_2 =sess.run([est1,est2,est1_sig,est2_sig],\
-                                    feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, y2i: y2i_utt_pad, sig: sig_utt_pad, seq_len: utt_len, keep_prob: 1, is_training: False})
+                                    feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, \
+                                    y2i: y2i_utt_pad, sig: sig_utt_pad, seq_len: utt_len, is_training: False})
                                 # Reshape and crop estimates
-                                input_shape_test, output_shape_test, _ = getUnetPadding(np.array([xr_utt.shape[0], xr_utt.shape[1]]), n_layers=4)
+                                input_shape_test, output_shape_test, _ = getUnetPadding(np.array([xr_utt.shape[0], xr_utt.shape[1]]), n_layers=4, is_causal=True)
                                 est_1 = np.reshape(est_1, [-1, output_shape_test[1], 2])
                                 est_2 = np.reshape(est_2, [-1, output_shape_test[1], 2])
                                 est_1 = est_1[(output_shape_test[0]-time_tmp):,:-1,:]
@@ -656,14 +721,14 @@ with tf.Session() as sess:
         
         # Apply learning rate decay
         # Check every three epochs, if the cv snr does not increase for more than 6 epochs, apply lr_decay
-        if (step % (3*(total_tr_files // batch_size)) == 1) and (step != 1):
-            if step - best_cv_step >= int(5.9*(total_tr_files / batch_size)):
+        if (step % (3*steps_per_epoch) == 1) and (step != 1):
+            if step - best_cv_step >= int(5.9*steps_per_epoch):
                 learning_rate *= FLAGS.lr_decay
 
         # Run one batch of training
         _, train_cost, train_snr, q_size\
         = sess.run([optimizer, cost, snr, queue_size], \
-        feed_dict={lr: learning_rate, keep_prob: FLAGS.keep_prob, is_training: True})
+        feed_dict={lr: learning_rate, is_training: True})
 
         # Update snr and loss
         train_cost_sum += train_cost
@@ -672,7 +737,7 @@ with tf.Session() as sess:
 
         # If reaches display step, print loss
         if step % display_step == 1:
-            logging.info('Step %d/%d, Minibatch Loss=%f, SNR=%f, Q_size=%d, Learning Rate=%f',step, FLAGS.epoch * total_tr_files / batch_size, train_cost_sum/total_num, train_snr_sum/total_num, q_size, learning_rate)
+            logging.info('Step %d/%d, Minibatch Loss=%f, SNR=%f, Q_size=%d, Learning Rate=%f',step, FLAGS.epoch * steps_per_epoch, train_cost_sum/total_num, train_snr_sum/total_num, q_size, learning_rate)
             # Reset all snr and loss variables
             train_cost_sum = 0
             train_snr_sum = 0

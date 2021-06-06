@@ -67,7 +67,7 @@ batch_size = FLAGS.batch_size
 display_step = 400
 
 # Compute dimension of padded input feature and output feature in Dense-UNet
-input_shape_tmp, output_shape_tmp, crop_diff_list = getUnetPadding(np.array([1000, feat_dim]))
+input_shape_tmp, output_shape_tmp, crop_diff_list = getUnetPadding(np.array([1000, feat_dim]), is_causal=True)
 n_input = input_shape_tmp[1]
 n_output = output_shape_tmp[1]
 
@@ -152,7 +152,7 @@ def load_and_enqueue(sess, enqueue_op, coord, queue_index, total_queues):
             # Remove utterance-level paddings in STFT estimates
             est1_train_utt = np.squeeze(est1_est2_utt[0,:,:])
             est2_train_utt = np.squeeze(est1_est2_utt[1,:,:])
-            input_shape_utt, output_shape_utt, _ = getUnetPadding(np.array([y1_y2_x_utt.shape[1], y1_y2_x_utt.shape[2]]))
+            input_shape_utt, output_shape_utt, _ = getUnetPadding(np.array([y1_y2_x_utt.shape[1], y1_y2_x_utt.shape[2]]), is_causal=True)
             est1_train_utt = est1_train_utt[(output_shape_utt[0]-y1_y2_x_utt.shape[1]):,:]
             est2_train_utt = est2_train_utt[(output_shape_utt[0]-y1_y2_x_utt.shape[1]):,:] 
             est1_2batch.append(est1_train_utt)
@@ -162,7 +162,7 @@ def load_and_enqueue(sess, enqueue_op, coord, queue_index, total_queues):
         max_time = np.max(time_list)
         freq_dim = xr_2batch[0].shape[1]
         # Compute input and output shape for all samples in a batch
-        input_shape, output_shape, _ = getUnetPadding(np.array([max_time, freq_dim]))
+        input_shape, output_shape, _ = getUnetPadding(np.array([max_time, freq_dim]), is_causal=True)
 
         # Apply paddings to all training samples
         for batch_index in range(batch_size):
@@ -251,8 +251,8 @@ def assignment(Y1R,Y1I,Y2R,Y2I,EST1,EST2,_seq_len):
 
     return assign, loss, W_SEQ
 
-# Define TCN model
-def tcn(_est1,_est2,_xor,_xoi,_seq_len,keep_prob):
+# Define causal TCN model
+def causal_tcn(_est1,_est2,_xor,_xoi,_seq_len,keep_prob):
 
     with tf.variable_scope("grouping"):
         # Initializer for CNN kernels
@@ -269,8 +269,8 @@ def tcn(_est1,_est2,_xor,_xoi,_seq_len,keep_prob):
         inputI = tf.transpose(inputI, [0,2,1,3])
 
         # Crop input mixture to the size of Dense-UNet output
-        inputR = crop(inputR, crop_diff_list[-1])
-        inputI = crop(inputI, crop_diff_list[-1])
+        inputR = crop_causal(inputR, crop_diff_list[-1])
+        inputI = crop_causal(inputI, crop_diff_list[-1])
         inputR = tf.transpose(inputR, [0,2,1,3])
         inputI = tf.transpose(inputI, [0,2,1,3])
 
@@ -291,25 +291,25 @@ def tcn(_est1,_est2,_xor,_xoi,_seq_len,keep_prob):
         # A dense block for feature preprocessing
         NUM_INITIAL_FILTERS = 16
         X1_NEW = tf.layers.conv2d(X1, NUM_INITIAL_FILTERS, [1,3], activation=tf.nn.elu, padding='same', kernel_initializer=_initializer)
-        X1_NEW = tf.contrib.layers.layer_norm(X1_NEW)
+        X1_NEW = causal_layer_norm(X1_NEW, total_dim=4, name='pre_1')
 
         X1 = tf.concat([X1, X1_NEW], 3)
         X1_NEW = tf.layers.conv2d(X1, NUM_INITIAL_FILTERS, [1,3], activation=tf.nn.elu, padding='same', kernel_initializer=_initializer)
-        X1_NEW = tf.contrib.layers.layer_norm(X1_NEW)
+        X1_NEW = causal_layer_norm(X1_NEW, total_dim=4, name='pre_2')
 
         X1 = tf.concat([X1, X1_NEW], 3)
         X1_NEW = tf.layers.conv2d(X1, NUM_INITIAL_FILTERS, [1,3], activation=tf.nn.elu, padding='same', kernel_initializer=_initializer)
-        X1_NEW = tf.contrib.layers.layer_norm(X1_NEW)
+        X1_NEW = causal_layer_norm(X1_NEW, total_dim=4, name='pre_3')
 
         X1 = tf.concat([X1, X1_NEW], 3)
         X1_NEW = tf.layers.conv2d(X1, NUM_INITIAL_FILTERS, [1,3], activation=tf.nn.elu, padding='same', kernel_initializer=_initializer)
-        X1_NEW = tf.contrib.layers.layer_norm(X1_NEW)
+        X1_NEW = causal_layer_norm(X1_NEW, total_dim=4, name='pre_4')
 
         # Reshape the output of the dense block
         X1 = tf.reshape(X1_NEW, [num_seq, -1, n_output*NUM_INITIAL_FILTERS])
         # Linearly tranform the preprocessed feature 
         X1 = conv1d(X1, n_bottle, filter_width = 1, stride = 1, stddev=0.02, name = 'input_process')
-        X1 = tf.contrib.layers.layer_norm(X1)
+        X1 = causal_layer_norm(X1, total_dim=3, name='pre_5')
 
         # The actual TCN
         with tf.variable_scope("TCN"):
@@ -318,7 +318,7 @@ def tcn(_est1,_est2,_xor,_xoi,_seq_len,keep_prob):
                 for j in range(n_dilation_each_block):
                     dilation = np.power(2.0, j)
                     # Call each residual dilated sub-block
-                    X1 = residual_block(X1, rate=dilation, n_dilated_units=n_dilated_units, n_bottle=n_bottle, keep_prob=keep_prob, scope="res_%d_%d" % (i,dilation))
+                    X1 = residual_block(X1, rate=dilation, n_dilated_units=n_dilated_units, n_bottle=n_bottle, keep_prob=keep_prob, is_causal=True, scope="res_%d_%d" % (i,dilation))
                 skip_connections.append(X1)
 
             # Add skip connections
@@ -364,7 +364,7 @@ def seq_cost(V, Y, W, _seq_len):
 
 # Definition of the network and loss
 assign, cost_pit, w_seq = assignment(y1r, y1i, y2r, y2i, est1, est2, seq_len)
-embed = tcn(est1, est2, xr, xi, seq_len, keep_prob)
+embed = causal_tcn(est1, est2, xr, xi, seq_len, keep_prob)
 cost = seq_cost(embed, assign, w_seq,  seq_len)
 
 # Define loss and optimizer
@@ -452,13 +452,16 @@ with tf.Session() as sess:
                             est1_est2_utt = cv_est_buffer[file]
 
                         # load features and targets
-                        y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, None)
+                        y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, \
+                            y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, \
+                            sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, None, is_causal=True)
 
                         est_1 = np.squeeze(est1_est2_utt[0,:,:])
                         est_2 = np.squeeze(est1_est2_utt[1,:,:])
 
                         test_cost, test_cost_pit = sess.run([cost, cost_pit], \
-                        feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, y2i: y2i_utt_pad, est1: est_1, est2: est_2, seq_len: utt_len, keep_prob: 1, is_training: False})
+                        feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, \
+                            y2i: y2i_utt_pad, est1: est_1, est2: est_2, seq_len: utt_len, keep_prob: 1, is_training: False})
                         cost_list.append(test_cost)
                         cost_list_pit.append(test_cost_pit)
 
@@ -487,19 +490,22 @@ with tf.Session() as sess:
                         est1_est2_utt = np.load(base_folder+'/tt/'+line+'_simul_est.npy')
 
                         # load features and targets
-                        y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, None)
+                        y1r_utt, y1i_utt, y2r_utt, y2i_utt, xr_utt, xi_utt, sig_utt, utt_len, time_tmp, \
+                            y1r_utt_pad, y1i_utt_pad, y2r_utt_pad, y2i_utt_pad, xr_utt_pad, xi_utt_pad, \
+                            sig_utt_pad = single_utt_feature_proc(y1_y2_x_utt, None, is_causal=True)
 
                         est_1 = np.squeeze(est1_est2_utt[0,:,:])
                         est_2 = np.squeeze(est1_est2_utt[1,:,:])
 
                         start_time = time.time()
                         test_cost, embedding_test=sess.run([cost,embed],\
-                            feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, y2i: y2i_utt_pad, est1: est_1, est2: est_2, seq_len: utt_len, keep_prob: 1, is_training: False})
+                            feed_dict={xr: xr_utt_pad, xi: xi_utt_pad, y1r: y1r_utt_pad, y1i: y1i_utt_pad, y2r: y2r_utt_pad, \
+                                y2i: y2i_utt_pad, est1: est_1, est2: est_2, seq_len: utt_len, keep_prob: 1, is_training: False})
                         elapsed_time = time.time() - start_time
                         logging.info(line +' cost:' + str(test_cost) + ' time:' + str(elapsed_time))
 
                         # Reshape and crop spectral estimates
-                        input_shape_test, output_shape_test, _ = getUnetPadding(np.array([xr_utt.shape[0], xr_utt.shape[1]]), n_layers=4)
+                        input_shape_test, output_shape_test, _ = getUnetPadding(np.array([xr_utt.shape[0], xr_utt.shape[1]]), n_layers=4, is_causal=True)
                         est_1 = np.reshape(est_1, [-1, output_shape_test[1], 2])
                         est_2 = np.reshape(est_2, [-1, output_shape_test[1], 2])
                         est_1 = est_1[(output_shape_test[0]-time_tmp):,:-1,:]
@@ -511,6 +517,8 @@ with tf.Session() as sess:
                         embedding_test = np.squeeze(embedding_test)
                         embedding_test = embedding_test[(output_shape_test[0]-time_tmp):,:]
 
+                        '''
+                        # Non-causal clustering
                         # Get frames with significant energy
                         energy_est1 = np.sum(np.square(est_1),1)
                         w1_est = np.reshape((energy_est1>=2e-3*np.max(energy_est1)),[-1,1])
@@ -531,7 +539,67 @@ with tf.Session() as sess:
                         for time_frame in range(w_est.shape[0]):
                             embed_1 = np.reshape(embedding_test_2d[time_frame,:],[1,-1])
                             assigns[time_frame] = np.argmin(-np.sum((centroids*embed_1),1))
-                        
+                        '''
+
+                        # Start 2-speaker causal clustering
+                        embedding_test_2d = np.reshape(embedding_test,[-1,embedding_dim])
+                        # Similarity of the neighboring two frames
+                        embedding_test_similarity = np.sum((embedding_test_2d[:-1,:] * embedding_test_2d[1:,:]), 1, keepdims=True)
+                        embedding_test_similarity = np.concatenate((np.zeros([1,1]), embedding_test_similarity), 0)
+                        # If the neighboring has similarity >= 0.5, then they are similar
+                        neighboring_embedding_is_similar = np.asarray(embedding_test_similarity>=0.5, 'float32')
+
+                        # Frame-level energy
+                        frame_energy = np.sum(np.square(xr_utt)+np.square(xi_utt), 1)
+                        # Maximum energy
+                        max_energy = 0
+
+                        # Indicator of empty queue
+                        embedding_queue1_empty = True
+                        embedding_queue2_empty = True
+
+                        # Iterate all frames, get estimated assign
+                        assigns = np.ones(embedding_test_similarity.shape) *(-1)
+                        for time_frame in range(embedding_test_similarity.shape[0]):
+                            embed_t = np.reshape(embedding_test_2d[time_frame,:],[1,-1])
+                            max_energy = np.maximum(frame_energy[time_frame], max_energy)
+                            if time_frame == 0: 
+                                # First frame, intitalize queue 1
+                                embedding_queue1_empty = False
+                                embedding_queue1 = embed_t
+                                assigns[time_frame] = 0
+                            else:
+                                if embedding_queue2_empty:
+                                    # No item in queue 2
+                                    if neighboring_embedding_is_similar[time_frame] == 1:
+                                        assigns[time_frame] = 0
+                                        if frame_energy[time_frame] > 0.3 * max_energy:
+                                            embedding_queue1 = np.concatenate((embedding_queue1, embed_t), 0)
+                                    elif neighboring_embedding_is_similar[time_frame] == 0:
+                                        assigns[time_frame] = 1
+                                        embedding_queue2 = embed_t
+                                        embedding_queue2_empty = False
+                                else:
+                                    # Queue 2 is not empty
+                                    if np.sum((embed_t * embedding_queue1_mean)) > np.sum((embed_t * embedding_queue2_mean)):
+                                        assigns[time_frame] = 0
+                                        if frame_energy[time_frame] > 0.3 * max_energy:
+                                            embedding_queue1 = np.concatenate((embedding_queue1, embed_t), 0)
+                                    else:
+                                        assigns[time_frame] = 1
+                                        if frame_energy[time_frame] > 0.3 * max_energy:
+                                            embedding_queue2 = np.concatenate((embedding_queue2, embed_t), 0)
+                            if not embedding_queue1_empty:
+                                if  embedding_queue1.shape[0] > 10:
+                                    # Remove items from the queue if oversize
+                                    embedding_queue1 = embedding_queue1[1:,:]
+                                embedding_queue1_mean = np.mean(embedding_queue1, 0, keepdims=True)
+                            if not embedding_queue2_empty:
+                                if  embedding_queue2.shape[0] > 10:
+                                    # Remove items from the queue if oversize
+                                    embedding_queue2 = embedding_queue2[1:,:]
+                                embedding_queue2_mean = np.mean(embedding_queue2, 0, keepdims=True)
+
                         # Reassign estimates according to the estimated labels
                         est_all = np.concatenate((np.expand_dims(est_1,-1),np.expand_dims(est_2,-1)),2)
                         assigns = np.reshape(assigns, (-1,1,1))
